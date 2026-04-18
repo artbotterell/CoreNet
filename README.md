@@ -2,6 +2,8 @@
 
 *Draft for community discussion. Acknowledges prior art, addresses known objections, and describes an additive architecture — not a replacement for existing bridging work.*
 
+*Author: Art Botterell, KD6O — see [ABOUT.md](ABOUT.md).*
+
 ---
 
 ## Motivation
