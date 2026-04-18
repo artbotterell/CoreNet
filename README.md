@@ -50,7 +50,7 @@ Meshtastic's public MQTT broker was restructured in August 2024 after it became 
 3. **Adverts do not cross bridges by default.** The LAX↔SEA incident in Discussion #1736 is treated as settled precedent: this is a *messaging* bridge, not a *discovery* bridge. Discovery across regions is pull-based and explicit.
 4. **Identity is cryptographic, not administrative.** MeshCore nodes are already identified by Ed25519 keys. Bridge-plane identity derives from these.
 5. **Safe by default.** Users do not read manuals. Position precision, region scope, and propagation defaults must be safe even when nothing is configured.
-6. **Jurisdictional awareness.** Amateur radio deployments have hard legal constraints that vary by country. The architecture must not make ham-legal operation harder than ISM operation.
+6. **ISM-first, amateur-radio-friendly.** MeshCore generally operates on license-free ISM bands (e.g., 868 MHz in Europe, 915 MHz in the Americas), where there are no content, identification, or encryption restrictions beyond the usual ISM power and duty-cycle rules. **The default assumptions of this proposal are ISM assumptions.** Some licensed operators additionally run MeshCore at higher power under amateur radio rules on amateur allocations that overlap ISM (notably the 33 cm band in ITU Region 2); those deployments carry their own regulatory constraints, addressed separately below as an opt-in configuration.
 7. **No upstream firmware changes required.** Bridges operate as companions. Firmware-level changes may be proposed later but are not on the critical path.
 
 ---
@@ -64,7 +64,7 @@ LXMF is used here as an **interoperability format**, not as a mandated transport
 - **Transport-neutral.** An LXMF message can traverse Reticulum over TCP, serial, LoRa backbone, I2C, Bluetooth, or any combination — and can also be carried opaquely inside an MQTT message, a Bitchat payload, or any other envelope that an adapter defines.
 - **Cryptographically addressed.** LXMF destinations are derived from public keys, so identity survives transport changes without a naming service.
 - **Store-and-forward native.** Offline delivery works without extra machinery.
-- **Signed metadata.** Sender authentication is standard, which matters in amateur radio contexts where authentication is permitted but encryption is not.
+- **Signed metadata.** Sender authentication is standard — useful generally, and specifically important for the subset of deployments that operate under amateur radio rules, where authentication is permitted but encryption is not.
 - **Already proposed as MeshCore backhaul.** Discussion #1736 has laid groundwork; this proposal extends it with an adapter pattern.
 
 This proposal does **not** argue that Reticulum should replace MQTT. MQTT works, has existing deployments, and has strengths (low resource overhead, widely understood operational model). LXMF is proposed as the *common envelope* so that MQTT-bridged nodes and Reticulum-bridged nodes can reach each other without custom gateways for every pair.
@@ -121,7 +121,7 @@ Each adapter converts between LXMF and a specific transport:
 | `lxmf-tcp` | Direct TCP/HAMNET | Simple point-to-point links between two bridges. |
 | `lxmf-esp-now` | ESP-NOW | For short-haul out-of-band bridging that reuses the firmware's existing ESP-NOW bridge primitive. |
 
-A bridge loads whichever adapters are relevant to its deployment. Most bridges will run two (e.g., Reticulum + MQTT for backward compatibility with existing ham radio MQTT deployments).
+A bridge loads whichever adapters are relevant to its deployment. Most bridges will run two (e.g., Reticulum + MQTT for backward compatibility with existing MQTT deployments).
 
 ### What Crosses the Bridge
 
@@ -247,9 +247,11 @@ The principle: the user's first interaction with the bridge should make the priv
 
 ---
 
-## Amateur Radio Considerations
+## Amateur Radio Deployments (Optional Configuration)
 
-Bridging onto amateur radio frequencies imposes regulatory constraints that do not apply to ISM deployments. These vary by country; operators are responsible for their own compliance. This section outlines the US Part 97 situation (the most-discussed case) and flags where other jurisdictions differ.
+Most MeshCore deployments run on license-free ISM bands and have no licensing, identification, content, or encryption constraints beyond ordinary ISM rules. **This section does not apply to those deployments.** It exists for the subset of operators who hold amateur radio licenses and choose to run MeshCore at higher power under amateur radio rules on allocations that overlap ISM (principally the 33 cm band, 902–928 MHz, in ITU Region 2, where portions of the band are simultaneously available as ISM and as amateur radio).
+
+When an operator transmits under an amateur license, amateur radio regulations govern — not ISM rules. The constraints are real and vary by country; operators are responsible for their own compliance. This section outlines the US Part 97 situation (the most-discussed case) and flags where other jurisdictions differ.
 
 ### The Reticulum-Encryption Problem
 
