@@ -401,6 +401,8 @@ Specific questions where community input is most useful:
 
 Critique of the architecture — especially in places where prior experience contradicts it — is the most valuable form of feedback.
 
+Discussion happens in this repository's **[GitHub Discussions](https://github.com/artbotterell/CoreNet/discussions)** and **[Issues](https://github.com/artbotterell/CoreNet/issues)**. No email contact is maintained for this proposal; please keep the conversation in the open where others can learn from it.
+
 ---
 
 ## References
