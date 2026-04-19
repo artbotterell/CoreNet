@@ -273,13 +273,49 @@ class ReticulumLxmfTransport(LxmfTransportBase):
         self._inbound_callbacks: list[MessageCallback] = []
         self._announce_callbacks: list[PeerAnnounceCallback] = []
         self._announce_handler: Any = None
+        # Pending outbound messages keyed by destination hash, each entry is
+        # (enqueue_time, LxmfMessage).  Retried when the peer's announce arrives.
+        self._pending: dict[bytes, list[tuple[float, LxmfMessage]]] = {}
+        self._pending_ttl_seconds: float = 300.0   # drop if undeliverable after 5 minutes
 
     @property
     def identity_hash(self) -> bytes:
-        """The bridge's Reticulum identity hash (truncated to destination length)."""
-        if self._identity is None:
+        """The bridge's LXMF delivery destination hash.
+
+        This is what peers address to reach this bridge, and what travels in
+        announces.  It is distinct from the raw RNS identity hash: the
+        destination hash is `H(identity ‖ app_name ‖ "delivery")` while the
+        identity hash is only of the keypair.  Peers observe and recall the
+        destination hash, so that's what we expose.
+        """
+        if self._router is None:
             raise RuntimeError("transport not started")
-        return self._identity.hash
+        destinations = getattr(self._router, "delivery_destinations", {})
+        if not destinations:
+            raise RuntimeError("no delivery destination registered")
+        # We only register one delivery destination (our own identity),
+        # so take the first (and only) one.
+        return next(iter(destinations.keys()))
+
+    @property
+    def delivery_destination(self) -> Any:
+        """The RNS Destination object for our LXMF delivery endpoint."""
+        if self._router is None:
+            raise RuntimeError("transport not started")
+        destinations = getattr(self._router, "delivery_destinations", {})
+        if not destinations:
+            raise RuntimeError("no delivery destination registered")
+        return next(iter(destinations.values()))
+
+    async def announce_self(self) -> None:
+        """Announce our delivery destination on all connected interfaces.
+
+        Needed for peers to learn our path and identity before they can send
+        messages to us.  The daemon loop typically re-announces periodically.
+        """
+        if self._router is None:
+            raise RuntimeError("transport not started")
+        self._router.announce(self.identity_hash)
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -319,14 +355,17 @@ class ReticulumLxmfTransport(LxmfTransportBase):
         dest_identity = RNS.Identity.recall(params.dest_hash)
         if dest_identity is None:
             log.info(
-                "no cached identity for %s; requesting path and deferring",
+                "no cached identity for %s; queueing for path resolution",
                 params.dest_hash.hex(),
             )
+            self._enqueue_pending(params.dest_hash, msg)
             RNS.Transport.request_path(params.dest_hash)
-            # LXMF will queue and retry once the identity is learned via
-            # announce. Caller's retry logic (if any) handles the wait.
             return
 
+        self._deliver_now(dest_identity, params)
+
+    def _deliver_now(self, dest_identity: Any, params: "OutboundParams") -> None:
+        """Build and hand off an LXMessage for a peer whose identity is known."""
         # All LXMF traffic rides on the "lxmf.delivery" destination aspect
         # (spec §13.1); the CoreNet destination type (node / bridge / channel)
         # is carried in the message's custom_data.
@@ -337,21 +376,62 @@ class ReticulumLxmfTransport(LxmfTransportBase):
             LXMF.APP_NAME,
             "delivery",
         )
-
-        # Compose custom_data: always include the CoreNet aspect, plus any
-        # caller-provided app_data / raw_binary.
         custom_data = _compose_custom_data(params)
         fields = {LXMF.FIELD_CUSTOM_DATA: custom_data} if custom_data is not None else None
-
+        # LXMessage wants the sender's delivery Destination as `source`,
+        # not the raw Identity.
+        source_destination = self.delivery_destination
         lxm = LXMF.LXMessage(
             destination=outbound_dest,
-            source=self._identity,
+            source=source_destination,
             content=params.content,
             title=params.title,
             fields=fields,
             desired_method=params.desired_method,
         )
         self._router.handle_outbound(lxm)
+
+    def _enqueue_pending(self, dest_hash: bytes, msg: LxmfMessage) -> None:
+        """Hold an outbound message until the peer's announce arrives."""
+        self._expire_pending()
+        queue = self._pending.setdefault(dest_hash, [])
+        queue.append((time.time(), msg))
+
+    def _expire_pending(self) -> None:
+        cutoff = time.time() - self._pending_ttl_seconds
+        for dest_hash in list(self._pending.keys()):
+            fresh = [
+                (t, m) for (t, m) in self._pending[dest_hash] if t >= cutoff
+            ]
+            if fresh:
+                self._pending[dest_hash] = fresh
+            else:
+                del self._pending[dest_hash]
+
+    async def _flush_pending(self, dest_hash: bytes) -> None:
+        """Retry queued outbound messages for a peer whose identity just arrived."""
+        self._expire_pending()
+        queue = self._pending.pop(dest_hash, None)
+        if not queue:
+            return
+        dest_identity = RNS.Identity.recall(dest_hash)
+        if dest_identity is None:
+            # Identity still not recalled — put the messages back and wait.
+            self._pending[dest_hash] = queue
+            return
+        for _enqueued_at, msg in queue:
+            try:
+                params = to_outbound_params(msg)
+                self._deliver_now(dest_identity, params)
+            except Exception as e:   # pragma: no cover — defensive
+                log.warning("flush_pending: delivery failed: %s", e)
+
+    def pending_count(self, dest_hash: bytes | None = None) -> int:
+        """Number of messages queued awaiting path resolution."""
+        self._expire_pending()
+        if dest_hash is None:
+            return sum(len(q) for q in self._pending.values())
+        return len(self._pending.get(dest_hash, ()))
 
     async def announce(self, destination: str, app_data: bytes) -> None:
         if self._router is None:
@@ -398,6 +478,12 @@ class ReticulumLxmfTransport(LxmfTransportBase):
 
         for cb in list(self._announce_callbacks):
             asyncio.run_coroutine_threadsafe(cb(announce), self._loop)
+
+        # If we have outbound messages waiting on this peer's path, retry now.
+        if destination_hash in self._pending:
+            asyncio.run_coroutine_threadsafe(
+                self._flush_pending(destination_hash), self._loop
+            )
 
     # ------------------------------------------------------------------
     # Internals
