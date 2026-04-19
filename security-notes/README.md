@@ -35,17 +35,24 @@ and more useful. These notes exist to:
 ## Current notes
 
 - [001 — Shared-secret broadcast and the Meshtastic 2024 MQTT incident](001-shared-secret-broadcast-meshtastic-2024.md) (first published 2026-04-19)
+- [002 — Bridge operator trust: what end-to-end encryption protects and what it doesn't](002-bridge-operator-trust.md) (first published 2026-04-19)
+- [003 — Flood amplification and the LAX↔SEA precedent](003-flood-amplification-lax-sea.md) (first published 2026-04-19)
 
 ## Planned notes
 
 Not commitments, just directions worth documenting:
 
-- 002 — Bridge operator trust: what end-to-end encryption protects and what it doesn't
-- 003 — Identity compromise and revocation in decentralized systems
-- 004 — Metadata leakage in federated messaging
-- 005 — Channel secret distribution at scale
-- 006 — Part 97 and encryption: a practical guide for amateur deployments
-- 007 — Flood amplification and the LAX↔SEA precedent (MeshCore Discussion #1736)
+- 004 — Identity compromise and revocation in decentralized systems
+- 005 — Metadata leakage in federated messaging
+- 006 — Channel secret distribution at scale
+- 007 — Part 97 and encryption: a practical guide for amateur deployments
+- 008 — Replay attacks and freshness in shared-secret channels
+- 009 — Sybil attacks in identity-free networks
+- 010 — Traffic analysis in encrypted meshes
+- 011 — Position precision: spatial, temporal, and the shape of what leaks
+- 012 — Identity hash collisions: why the sky doesn't fall
+- 013 — "Local RF is private": a legend worth examining
+- 014 — Decentralization ≠ no trust: what you still trust in a federated system
 
 ## Contributing
 
