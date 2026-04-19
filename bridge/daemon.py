@@ -99,14 +99,14 @@ class Daemon:
         peers = PeerRegistry(self.config.router.name)
         control = MockControlChannel()   # real control-channel transport is TBD
 
-        # Seed peers from config
-        for p in self.config.peers:
-            peers.observe(PeerAnnounce(
-                identity_hash=p.hash_bytes(),
-                public_key=b"\x00" * 32,   # unknown until announce observed
-                router_name=p.router_name,
-                observed_at=0.0,
-            ))
+        # Remember expected peers from config so we can cross-check announces
+        # against the operator's known-peer list.  We do NOT feed these into
+        # the PeerRegistry with placeholder pubkeys — that would cause every
+        # real announce to look like a conflict.  Real pubkeys arrive via
+        # the announce callback (wired below).
+        self._expected_peers = {
+            p.hash_bytes(): p.router_name for p in self.config.peers
+        }
 
         # Construct radio first so the frame-callback can close over the router
         # (we need to set up a forward reference).
@@ -145,6 +145,15 @@ class Daemon:
                 self.router.local_hash = self.lxmf.identity_hash.hex()  # type: ignore[attr-defined]
             except Exception as e:
                 log.debug("could not populate local_hash from transport: %s", e)
+
+        # Wire peer announces from the LXMF transport into the router so new
+        # peers are learned dynamically (spec §10; prerequisite for two-bridge
+        # liveness without hardcoded identity hashes).
+        if hasattr(self.lxmf, "add_announce_callback"):
+            async def _on_announce(announce):
+                if self.router is not None:
+                    await self.router.observe_peer_announce(announce)
+            self.lxmf.add_announce_callback(_on_announce)   # type: ignore[attr-defined]
 
         # Activate nailed-up bridges
         for b in self.config.bridges:

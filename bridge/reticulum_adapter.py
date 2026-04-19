@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from bridge.companion.types import LxmfDestType, LxmfTransport
+from bridge.conflicts import PeerAnnounce
 from bridge.lxmf_layer.transport import (
     FIELD_APP_DATA,
     FIELD_RAW_BINARY,
@@ -26,6 +29,12 @@ from bridge.lxmf_layer.transport import (
     LxmfTransportBase,
     MessageCallback,
 )
+
+# Key used inside FIELD_APP_DATA to carry the CoreNet destination aspect
+# (node / bridge / channel) when that dict is the whole custom_data payload.
+_CORENET_ASPECT_KEY = "_corenet_aspect"
+
+PeerAnnounceCallback = Callable[[PeerAnnounce], Awaitable[None]]
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +102,46 @@ class OutboundParams:
     title: str
     custom_data: Any | None
     desired_method: int          # LXMF.LXMessage delivery method code
+
+
+def _compose_custom_data(params: "OutboundParams") -> Any | None:
+    """Build the custom_data payload including the CoreNet aspect.
+
+    Keeps dict/bytes payloads distinguishable so the receiver can tell
+    them apart.  The CoreNet aspect lands under _CORENET_ASPECT_KEY when
+    the payload is (or becomes) a dict.
+    """
+    existing = params.custom_data
+    if existing is None:
+        return {_CORENET_ASPECT_KEY: params.dest_aspect}
+    if isinstance(existing, dict):
+        out = dict(existing)
+        out[_CORENET_ASPECT_KEY] = params.dest_aspect
+        return out
+    # Binary or other non-dict payload — wrap in a dict to preserve the aspect.
+    return {_CORENET_ASPECT_KEY: params.dest_aspect, "raw": existing}
+
+
+def _extract_corenet_aspect(custom_data: Any) -> str:
+    """Pull the CoreNet aspect out of inbound custom_data; default to 'node'."""
+    if isinstance(custom_data, dict):
+        aspect = custom_data.get(_CORENET_ASPECT_KEY)
+        if isinstance(aspect, str) and aspect in ("node", "bridge", "channel"):
+            return aspect
+    return "node"
+
+
+def _strip_corenet_aspect(custom_data: Any) -> Any:
+    """Return custom_data with the aspect key removed, for handing to callers."""
+    if not isinstance(custom_data, dict):
+        return custom_data
+    if _CORENET_ASPECT_KEY not in custom_data:
+        return custom_data
+    stripped = {k: v for k, v in custom_data.items() if k != _CORENET_ASPECT_KEY}
+    # If only "raw" remains and we had wrapped a bytes payload, unwrap it.
+    if set(stripped.keys()) == {"raw"}:
+        return stripped["raw"]
+    return stripped or None
 
 
 def to_outbound_params(msg: LxmfMessage) -> OutboundParams:
@@ -222,6 +271,8 @@ class ReticulumLxmfTransport(LxmfTransportBase):
         self._router: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._inbound_callbacks: list[MessageCallback] = []
+        self._announce_callbacks: list[PeerAnnounceCallback] = []
+        self._announce_handler: Any = None
 
     @property
     def identity_hash(self) -> bytes:
@@ -244,7 +295,17 @@ class ReticulumLxmfTransport(LxmfTransportBase):
         )
         self._router.register_delivery_callback(self._on_lxmf_received)
 
+        # Listen for LXMF delivery announces so we can notify callers of new peers
+        self._announce_handler = _PeerAnnounceHandler(self)
+        RNS.Transport.register_announce_handler(self._announce_handler)
+
     async def stop(self) -> None:
+        if self._announce_handler is not None:
+            try:
+                RNS.Transport.deregister_announce_handler(self._announce_handler)
+            except Exception as e:   # pragma: no cover
+                log.debug("error deregistering announce handler: %s", e)
+            self._announce_handler = None
         if self._router is not None:
             try:
                 self._router.exit_handler()
@@ -258,23 +319,30 @@ class ReticulumLxmfTransport(LxmfTransportBase):
         dest_identity = RNS.Identity.recall(params.dest_hash)
         if dest_identity is None:
             log.info(
-                "no cached identity for %s; message queued for path resolution",
+                "no cached identity for %s; requesting path and deferring",
                 params.dest_hash.hex(),
             )
             RNS.Transport.request_path(params.dest_hash)
-            # LXMF itself will queue and retry as paths establish, so still build.
+            # LXMF will queue and retry once the identity is learned via
+            # announce. Caller's retry logic (if any) handles the wait.
             return
 
+        # All LXMF traffic rides on the "lxmf.delivery" destination aspect
+        # (spec §13.1); the CoreNet destination type (node / bridge / channel)
+        # is carried in the message's custom_data.
         outbound_dest = RNS.Destination(
             dest_identity,
             RNS.Destination.OUT,
             RNS.Destination.SINGLE,
             LXMF.APP_NAME,
-            params.dest_aspect,
+            "delivery",
         )
-        fields = None
-        if params.custom_data is not None:
-            fields = {LXMF.FIELD_CUSTOM_DATA: params.custom_data}
+
+        # Compose custom_data: always include the CoreNet aspect, plus any
+        # caller-provided app_data / raw_binary.
+        custom_data = _compose_custom_data(params)
+        fields = {LXMF.FIELD_CUSTOM_DATA: custom_data} if custom_data is not None else None
+
         lxm = LXMF.LXMessage(
             destination=outbound_dest,
             source=self._identity,
@@ -293,6 +361,43 @@ class ReticulumLxmfTransport(LxmfTransportBase):
 
     def add_inbound_callback(self, cb: MessageCallback) -> None:
         self._inbound_callbacks.append(cb)
+
+    def add_announce_callback(self, cb: PeerAnnounceCallback) -> None:
+        """Register a coroutine to be called for each LXMF delivery announce."""
+        self._announce_callbacks.append(cb)
+
+    def _on_peer_announce(
+        self,
+        destination_hash: bytes,
+        announced_identity: Any,
+        app_data: bytes | None,
+    ) -> None:
+        """Called from an RNS thread by _PeerAnnounceHandler."""
+        try:
+            pubkey = announced_identity.get_public_key()
+            # LXMF's display-name-from-app-data helper is tolerant of None/empty
+            display_name = ""
+            if app_data is not None:
+                try:
+                    display_name = LXMF.display_name_from_app_data(app_data) or ""
+                except Exception:
+                    display_name = ""
+
+            announce = PeerAnnounce(
+                identity_hash=destination_hash,
+                public_key=pubkey,
+                router_name=display_name or destination_hash.hex()[:8],
+                observed_at=time.time(),
+            )
+        except Exception as e:   # pragma: no cover
+            log.error("failed to build PeerAnnounce: %s", e)
+            return
+
+        if self._loop is None:
+            return
+
+        for cb in list(self._announce_callbacks):
+            asyncio.run_coroutine_threadsafe(cb(announce), self._loop)
 
     # ------------------------------------------------------------------
     # Internals
@@ -313,6 +418,11 @@ class ReticulumLxmfTransport(LxmfTransportBase):
             custom_data = None
             if getattr(lxm, "fields", None):
                 custom_data = lxm.fields.get(LXMF.FIELD_CUSTOM_DATA)
+            # Extract the CoreNet aspect the sender embedded, then strip it so
+            # it doesn't leak into caller-visible app_data.
+            aspect = _extract_corenet_aspect(custom_data)
+            cleaned_custom = _strip_corenet_aspect(custom_data)
+
             # LXMF stores destination hash on the message in different attrs
             # across versions; be defensive.
             dest_hash = (
@@ -326,10 +436,10 @@ class ReticulumLxmfTransport(LxmfTransportBase):
             params = InboundParams(
                 content=lxm.content_as_string() if hasattr(lxm, "content_as_string") else (lxm.content or ""),
                 title=getattr(lxm, "title", "") or "",
-                custom_data=custom_data,
+                custom_data=cleaned_custom,
                 source_hash=source_hash,
                 destination_hash=dest_hash,
-                destination_aspect="node",  # LXMF flattens aspects; assume node
+                destination_aspect=aspect,
                 desired_method=getattr(lxm, "desired_method", 2),
             )
             msg = to_lxmf_message(params)
@@ -343,3 +453,41 @@ class ReticulumLxmfTransport(LxmfTransportBase):
 
         for cb in list(self._inbound_callbacks):
             asyncio.run_coroutine_threadsafe(cb(msg), self._loop)
+
+
+# ---------------------------------------------------------------------------
+# Announce handler (duck-typed per RNS convention)
+# ---------------------------------------------------------------------------
+
+if _HAS_RETICULUM:
+
+    class _PeerAnnounceHandler:
+        """Forwards LXMF delivery announces to ReticulumLxmfTransport callbacks.
+
+        Registered with RNS.Transport.register_announce_handler; RNS invokes
+        `received_announce` from its own thread when a matching announce
+        arrives.
+        """
+
+        aspect_filter = f"{LXMF.APP_NAME}.delivery"
+        receive_path_responses = True
+
+        def __init__(self, transport: "ReticulumLxmfTransport") -> None:
+            self._transport = transport
+
+        def received_announce(
+            self,
+            destination_hash: bytes,
+            announced_identity: Any,
+            app_data: bytes | None,
+        ) -> None:
+            # Ignore announces for our own identity
+            try:
+                if self._transport._identity is not None:
+                    if destination_hash == self._transport._identity.hash:
+                        return
+            except Exception:
+                pass
+            self._transport._on_peer_announce(
+                destination_hash, announced_identity, app_data
+            )

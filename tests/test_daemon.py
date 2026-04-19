@@ -88,7 +88,10 @@ class TestNailedUpBridges:
 
 
 class TestPeerSeeding:
-    async def test_peers_from_config_in_registry(self):
+    async def test_config_peers_recorded_as_expected(self):
+        """Config-level peers are tracked as expected-peers but not inserted
+        into the PeerRegistry with placeholder pubkeys (that would cause
+        every real announce to look like a conflict)."""
         cfg = _config(peers=[
             {
                 "router_name": "bridge.sea.example.net",
@@ -102,10 +105,12 @@ class TestPeerSeeding:
         daemon = Daemon(cfg)
         await daemon.start()
 
-        peers = daemon.router.peers.incumbents()
-        assert len(peers) == 2
-        assert bytes.fromhex("aa" * 16) in peers
-        assert bytes.fromhex("bb" * 16) in peers
+        assert daemon._expected_peers == {
+            bytes.fromhex("aa" * 16): "bridge.sea.example.net",
+            bytes.fromhex("bb" * 16): "bridge.pdx.example.net",
+        }
+        # Registry is empty until real announces arrive
+        assert len(daemon.router.peers.incumbents()) == 0
         await daemon.stop()
 
 

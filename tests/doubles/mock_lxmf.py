@@ -35,6 +35,7 @@ class MockLxmfTransport(LxmfTransportBase):
         self.sent: list[LxmfMessage] = []
         self.announces: list[tuple[str, bytes]] = []   # (destination, app_data)
         self._callbacks: list[MessageCallback] = []
+        self._announce_callbacks: list = []
         self._started = False
 
     # ------------------------------------------------------------------
@@ -55,6 +56,15 @@ class MockLxmfTransport(LxmfTransportBase):
 
     def add_inbound_callback(self, cb: MessageCallback) -> None:
         self._callbacks.append(cb)
+
+    def add_announce_callback(self, cb) -> None:
+        """Mirror of ReticulumLxmfTransport.add_announce_callback for tests."""
+        self._announce_callbacks.append(cb)
+
+    async def inject_announce(self, announce) -> None:
+        """Simulate a peer-announce arrival."""
+        for cb in self._announce_callbacks:
+            await cb(announce)
 
     # ------------------------------------------------------------------
     # Test-side injection
