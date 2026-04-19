@@ -75,10 +75,15 @@ class PublicationState:
     `expires_at` is a Unix timestamp; None means persistent.  When
     is_published() is queried and expiration has passed, state reverts to
     unpublished automatically (spec §8.4.2).
+
+    `source_timestamp` is the clock time of the control message that
+    established this state, used for convergence when two routers gossip
+    their states (spec §8.5.2 — latest-timestamp wins).
     """
     published: bool
     set_at: float
     expires_at: float | None = None
+    source_timestamp: float = 0.0
 
     def is_published(self, now: float | None = None) -> bool:
         if not self.published:
@@ -100,6 +105,7 @@ class ChannelRegistry:
     def __init__(self, seen_tag_ttl: float = 60.0, seen_tag_max: int = 10000) -> None:
         self._state: dict[bytes, PublicationState] = {}
         self._names: dict[bytes, str] = {}
+        self._indices: dict[bytes, int] = {}
         self._seen: OrderedDict[bytes, float] = OrderedDict()
         self._seen_ttl = seen_tag_ttl
         self._seen_max = seen_tag_max
@@ -108,9 +114,22 @@ class ChannelRegistry:
     # Channel registration
     # ------------------------------------------------------------------
 
-    def register(self, channel_hash: bytes, channel_name: str) -> None:
-        """Register a channel as bridged (by the operator or ad-hoc command)."""
+    def register(
+        self,
+        channel_hash: bytes,
+        channel_name: str,
+        channel_idx: int | None = None,
+    ) -> None:
+        """Register a channel as bridged (by the operator or ad-hoc command).
+
+        `channel_idx` is the local MeshCore radio's slot index for this channel
+        (0-255), used when the bridge posts notices back into the channel via
+        pack_send_channel_msg.  None means the bridge isn't tracking a radio
+        index yet (mock / unit-test case).
+        """
         self._names[channel_hash] = channel_name
+        if channel_idx is not None:
+            self._indices[channel_hash] = channel_idx
         # Unpublished by default (spec §8.4)
         if channel_hash not in self._state:
             self._state[channel_hash] = PublicationState(
@@ -121,9 +140,13 @@ class ChannelRegistry:
         """Remove a channel from the registry (e.g., nailed-up bridge torn down)."""
         self._state.pop(channel_hash, None)
         self._names.pop(channel_hash, None)
+        self._indices.pop(channel_hash, None)
 
     def name_for(self, channel_hash: bytes) -> str | None:
         return self._names.get(channel_hash)
+
+    def index_for(self, channel_hash: bytes) -> int | None:
+        return self._indices.get(channel_hash)
 
     def is_registered(self, channel_hash: bytes) -> bool:
         return channel_hash in self._names
@@ -138,12 +161,17 @@ class ChannelRegistry:
         control: ControlMessage,
         *,
         now: float | None = None,
+        source_timestamp: float | None = None,
     ) -> None:
         """Apply a publish or unpublish control message to a channel.
 
         Per spec §8.4.2, the most recent valid control message wins.
+        `source_timestamp` is the message's internal timestamp (used for
+        gossip convergence); if omitted, `now` is used.
         """
         t = time.time() if now is None else now
+        src_ts = source_timestamp if source_timestamp is not None else t
+
         if not self.is_registered(channel_hash):
             # Unknown channel — we're not bridging it, so the control is moot.
             return
@@ -153,12 +181,18 @@ class ChannelRegistry:
                 None if control.duration_seconds is None else t + control.duration_seconds
             )
             self._state[channel_hash] = PublicationState(
-                published=True, set_at=t, expires_at=expires_at
+                published=True, set_at=t, expires_at=expires_at,
+                source_timestamp=src_ts,
             )
         elif isinstance(control, UnpublishControl):
             self._state[channel_hash] = PublicationState(
-                published=False, set_at=t, expires_at=None
+                published=False, set_at=t, expires_at=None,
+                source_timestamp=src_ts,
             )
+
+    def get_state(self, channel_hash: bytes) -> PublicationState | None:
+        """Return the current publication state, or None if not tracked."""
+        return self._state.get(channel_hash)
 
     def is_published(self, channel_hash: bytes, *, now: float | None = None) -> bool:
         state = self._state.get(channel_hash)

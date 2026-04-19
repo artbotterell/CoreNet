@@ -46,6 +46,7 @@ from bridge.commands import (
 from bridge.companion.protocol import (
     ChannelMessage,
     ContactMessage,
+    pack_send_channel_msg,
     pack_send_txt_msg,
 )
 from bridge.companion.types import CommandType, LxmfTransport, PacketType
@@ -395,11 +396,18 @@ class Router:
             )
 
         mins = cmd.duration_seconds // 60
+        await self._post_activation_notice(channel_hash, cmd.duration_seconds)
         return f"Bridging #{cmd.channel_name} enabled for {mins} minute(s)."
 
     async def _handle_unbridge(self, sender_prefix: bytes, cmd: Unbridge) -> str:
         channel_hash = self._derive_channel_hash(cmd.channel_name)
         removed = self._active_bridges.pop(channel_hash, None)
+
+        # Post the expire notice into the channel BEFORE we unregister (we
+        # need the name/index from the registry to format and route it).
+        if removed is not None:
+            await self._post_expire_notice(channel_hash, early=True)
+
         self.channels.unregister(channel_hash)
 
         if removed is not None and self.control_channel:
@@ -418,11 +426,14 @@ class Router:
         return f"Bridging #{cmd.channel_name} ended."
 
     def activate_nailed_up_bridge(
-        self, channel_name: str, channel_secret: bytes
+        self,
+        channel_name: str,
+        channel_secret: bytes,
+        channel_idx: int | None = None,
     ) -> bytes:
         """Operator-config entry point for a persistent bridge."""
         channel_hash = self._derive_channel_hash(channel_name, channel_secret)
-        self.channels.register(channel_hash, channel_name)
+        self.channels.register(channel_hash, channel_name, channel_idx=channel_idx)
         self._active_bridges[channel_hash] = ActiveBridge(
             channel_name=channel_name,
             channel_hash=channel_hash,
@@ -439,6 +450,85 @@ class Router:
                 )
             )
         return channel_hash
+
+    # ------------------------------------------------------------------
+    # In-channel notices (spec §8.6)
+    # ------------------------------------------------------------------
+
+    async def _post_channel_notice(self, channel_hash: bytes, text: str) -> None:
+        """Post a human-readable notice into the channel via the local radio.
+
+        No-op if the radio transport is absent, the channel isn't registered,
+        or we don't have an index for it (can't tell the radio which slot).
+        """
+        if self.radio is None:
+            return
+        idx = self.channels.index_for(channel_hash)
+        if idx is None:
+            return
+        await self.radio.send_command(pack_send_channel_msg(idx, text))
+
+    def _channel_notice_time(self) -> str:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(self._clock(), tz=_dt.timezone.utc).strftime(
+            "%H:%M UTC"
+        )
+
+    def _callsign_for(self, prefix: bytes | None) -> str | None:
+        if prefix is None:
+            return None
+        entry = self.contacts.get(prefix)
+        return entry.display_name if entry else None
+
+    async def _post_publish_notice(
+        self, channel_hash: bytes, sender_prefix: bytes | None
+    ) -> None:
+        name = self.channels.name_for(channel_hash)
+        if not name:
+            return
+        callsign = self._callsign_for(sender_prefix)
+        attribution = f" Posted by @{callsign} at {self._channel_notice_time()}." if callsign else ""
+        text = (
+            f"[CoreNet] #{name} is now publicly discoverable across the federation."
+            f"{attribution} Any member may revert with ::corenet unpublish::"
+        )
+        await self._post_channel_notice(channel_hash, text)
+
+    async def _post_unpublish_notice(
+        self, channel_hash: bytes, sender_prefix: bytes | None
+    ) -> None:
+        name = self.channels.name_for(channel_hash)
+        if not name:
+            return
+        callsign = self._callsign_for(sender_prefix)
+        attribution = f" Reverted by @{callsign} at {self._channel_notice_time()}." if callsign else ""
+        text = (
+            f"[CoreNet] #{name} is no longer publicly discoverable.{attribution}"
+        )
+        await self._post_channel_notice(channel_hash, text)
+
+    async def _post_activation_notice(
+        self, channel_hash: bytes, duration_seconds: int
+    ) -> None:
+        name = self.channels.name_for(channel_hash)
+        if not name:
+            return
+        mins = duration_seconds // 60
+        text = (
+            f"[CoreNet] #{name} bridging activated for {mins} minute(s). "
+            f"Traffic will cross the wide-area federation until expiration."
+        )
+        await self._post_channel_notice(channel_hash, text)
+
+    async def _post_expire_notice(self, channel_hash: bytes, *, early: bool) -> None:
+        name = self.channels.name_for(channel_hash)
+        if not name:
+            return
+        qualifier = "ended" if early else "expired"
+        text = (
+            f"[CoreNet] #{name} bridging {qualifier}. Traffic is now zone-local again."
+        )
+        await self._post_channel_notice(channel_hash, text)
 
     @staticmethod
     def _derive_channel_hash(name: str, secret: bytes = b"") -> bytes:
@@ -466,6 +556,7 @@ class Router:
         text: str,
         *,
         from_rf: bool,
+        sender_prefix: bytes | None = None,
     ) -> bool:
         """Handle one channel message passing through this bridge.
 
@@ -474,13 +565,27 @@ class Router:
         arrived from a wide-area peer (and should be re-emitted on local RF
         if not a duplicate).
 
+        `sender_prefix` is the 6-byte prefix of the original sender's pubkey,
+        when known; used to attribute publish/unpublish notices.
+
         Returns True if the message should be forwarded, False if it was
         dropped (loop) or consumed as a control message.
         """
         # Control messages are consumed, not forwarded
         control = parse_control_message(text)
         if control is not None:
+            was_published = self.channels.is_published(
+                channel_hash, now=self._clock()
+            )
             self.channels.apply_control(channel_hash, control, now=self._clock())
+            now_published = self.channels.is_published(
+                channel_hash, now=self._clock()
+            )
+            # Emit a human-readable notice on state transitions (spec §8.6)
+            if isinstance(control, PublishControl) and not was_published:
+                await self._post_publish_notice(channel_hash, sender_prefix)
+            elif isinstance(control, UnpublishControl) and was_published:
+                await self._post_unpublish_notice(channel_hash, sender_prefix)
             return False
 
         # Loop prevention
