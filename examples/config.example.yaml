@@ -1,0 +1,58 @@
+# Example CoreNet bridge daemon configuration.
+#
+# Run the bridge with:
+#   python -m bridge --config /path/to/this.yaml
+# or (after `pip install -e .`):
+#   corenet-bridge --config /path/to/this.yaml
+
+router:
+  # Fully-qualified router name (DNS-like).  Used as the canonical identifier
+  # in CoreNet addressing and manifest exchange.  No global uniqueness is
+  # enforced; operators choose meaningful names.
+  name: bridge.example.net
+  # Optional short tag used when a compact address form is convenient.
+  short_tag: EX
+  # The bridge's callsign on its local MeshCore RF mesh.  Users address
+  # the bridge by this callsign to reach CoreNet commands and routing.
+  local_callsign: BRIDGE-EX
+  # Human-readable zone description, included in the router-online
+  # announcement on the control channel.
+  zone_description: "Example Zone"
+
+radio:
+  # type: "serial" (real radio) or "mock" (for testing)
+  type: serial
+  # Serial port device path.  On macOS this is typically /dev/tty.usbmodem*;
+  # on Linux, /dev/ttyACM* or /dev/ttyUSB*.
+  port: /dev/tty.usbmodem1101
+  baudrate: 115200
+
+reticulum:
+  # type: "reticulum" (live RNS/LXMF) or "mock" (for testing)
+  type: reticulum
+  # Optional: override Reticulum config, identity, and LXMF storage paths.
+  # Defaults use ~/.reticulum and ~/.lxmf — uncomment and customise if you
+  # want distinct paths per bridge on the same host.
+  # config_dir: ~/.config/corenet/reticulum
+  # identity_path: ~/.config/corenet/identity
+  # storage_path: ~/.config/corenet/lxmf
+  display_name: "CoreNet Example Bridge"
+
+# Nailed-up channel bridges (spec §8.2.1).  Each entry is a channel this
+# bridge persistently forwards between local RF and the wide-area plane.
+bridges:
+  - name: corenet-wa
+    # 16-byte channel secret, hex-encoded (exactly 32 hex chars).
+    # Must match the secret on the radios that participate in this channel.
+    secret: aabbccddeeff00112233445566778899
+    # The local MeshCore channel slot index (0-255).  Used for sending
+    # in-channel notices back to the channel.
+    channel_idx: 3
+
+# Known peer routers.  v0.1 uses a hardcoded list; dynamic discovery via
+# announces is a later milestone.
+peers:
+  - router_name: bridge.sea.example.net
+    identity_hash: deadbeefcafebabe1122334455667788
+  - router_name: bridge.pdx.example.net
+    identity_hash: feedfacecafebeef0011223344556677
