@@ -12,6 +12,7 @@
 
 - [`corenet-spec-v0.1.md`](corenet-spec-v0.1.md) — the normative protocol specification
 - [`meshcore-lxmf-encoding.md`](meshcore-lxmf-encoding.md) — reference message encoding table
+- [`security-notes/`](security-notes/) — reference notes on security-relevant incidents and design choices
 - [`bridge/`](bridge/) and [`tests/`](tests/) — Python reference implementation sketch
 
 ---
